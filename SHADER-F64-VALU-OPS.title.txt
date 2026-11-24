@@ -1,0 +1,1 @@
+rdna2spirv: v_mul/fma/min/max_f64 and the f64 <-> f32/int conversions (SHADER-F64-VALU-OPS)

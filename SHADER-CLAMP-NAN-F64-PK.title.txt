@@ -1,0 +1,1 @@
+rdna2spirv: f64 and packed f16 clamp of a NaN gives +0 (SHADER-CLAMP-NAN-F64-PK)

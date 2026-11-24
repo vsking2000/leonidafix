@@ -1,0 +1,1 @@
+tools: div_scale_probe measures v_div_scale on GFX10 hardware (SHADER-DIV-SCALE-PROBE)

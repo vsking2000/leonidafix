@@ -1,0 +1,21 @@
+finding: `v_div_scale_f32`/`v_div_scale_f64` cannot be translated from public sources: the ISA text, the LLVM lowering and the RDNA3 hardware tests disagree at the edges, so the rule must come from a gfx1036 measurement.
+
+**Where:** `tools/rdna2spirv.py` line 12447 (upstream/main `6558d53`), the generic `raise Unsupported(op)` at the end of the VALU dispatch; both ops reach it by name. **Needs:** an RDNA2 GPU (gfx1036 is enough) running `tools/hw_oracle` in the game MODE (`ieee=0`, `dx10_clamp=1`, `denorm32=0`, `denorm16_64=3`), wave32 and wave64. No game files. **Why it matters:** the game does not use the op (all its shaders translate), but it is the first step of the AMD IEEE divide (`div_scale` x2, `rcp`, fmas, `v_div_fmas`, `v_div_fixup`), and a rule written from the document text would be wrong (see the last point).
+
+**Probe matrix** (record D and the VCC bit for each call; f32 thresholds first, f64 in brackets; run each pair as both the denominator call `(S1, S1, S2)` and the numerator call `(S2, S1, S2)`, plus `S0 == S1 == S2`):
+- zero S1, zero S2, +-0, both zero; inf and NaN (quiet and signalling) in each source
+- denormal S1, denormal S2, denormal S0 (does `denorm32=0` flush them before the tests?)
+- exponent gap `exp(S2) - exp(S1)` = 95 / 96 / 97 [767 / 768 / 769]
+- |S1| just below and above 2^126 [2^1022] (where 1/S1 becomes denormal), with the quotient normal and with it denormal
+- quotient just above, exactly at and below the smallest normal 2^-126 [2^-1022] (e.g. `2^-126 / 1.0`)
+- biased `exp(S2)` = 22 / 23 / 24 [52 / 53 / 54]
+- normal operands with none of the above (expect D = S0, VCC = 0)
+- `abs`/`neg` on each source, `clamp`, `mul:2`/`div:2`, an SGPR-pair (wave64) or SGPR (wave32) mask destination instead of VCC
+- then the whole LLVM divide sequence on the same pairs, final quotient compared with the correctly rounded one
+
+**Sources and how they disagree** (all public; checked by reading them on 2026-11-24):
+1. AMD ISA document text, as extracted into tinygrad (`tinygrad/runtime/autogen/amd/rdna3/str_pcode.py`, and identical in the `rdna4/` and `cdna/` files): the zero branch only assigns NaN and leaves VCC at 0, and no branch assigns D when none of the cases applies. In the f32 form the reciprocal test is written `1.0 / 64'F(S1.f32) == DENORM.f64`, which no f32 S1 satisfies, so its two "1/S1 is denormal" branches never fire. **Unverified:** the RDNA2 document's wording (amd.com was not reachable); older emulators (gem5 `src/arch/amdgpu/vega/insts/vop3.cc`, f64 only; yoshou/amdgpu-sim `src/gcn_processor.rs`) test 1/S1 in the operand's own width instead.
+2. LLVM `llvm/lib/Target/AMDGPU/SIISelLowering.cpp`, `LowerFDIV32`/`LowerFDIV64`: the scaled values are used directly, which needs D = S0 when nothing is scaled. Only the numerator call's flag feeds `div_fmas`. The SI workaround rebuilds that flag as "exactly one of the two calls changed its value", which agrees with the document's VCC = 0 for the zero and tiny-numerator branches.
+3. tinygrad's RDNA3 hardware tests (`test/amd/hw/test_vop3.py`, classes `TestDivScale`/`TestDivScaleF64`; emulator fixes in `test/mockgpu/amd/emu.py`, `_fix_div_scale`) contradict the document text in these places: zero operand gives NaN **with VCC = 1**; denormal S1 gives NaN; `2^-126 / 1.0` (numerator call) gives VCC = 1 and D = 2^-62; for S0 = S2 = 1.0, S1 = 2^127 it gives D = 1.0, VCC = 1, which the newer text (D = 2^64) does not. They agree on D = S0, VCC = 0 for normal operands and on the exponent-gap branch. **Unverified:** that these tests passed on hardware in their last run, and which GPU and MODE they used.
+
+**1.0 / 2^127 rules out the older f32 reading:** I ran the LLVM f32 sequence through the current translator with each reading's `div_scale` results hard-coded. The translator's `v_div_fmas_f32` and `v_div_fixup_f32` follow gfx1036 measurements (docs/design.md rows). With the older reading, the denominator call scales 2^127 by 2^64 to +inf, `rcp` gives 0, the fma gives NaN, and `v_div_fixup_f32` rule 7 turns that NaN into **+inf** (0x7f800000). The newer reading gives 0 (2^-127 flushed). Real hardware does not divide 1.0f by 2^127 into +inf. The newer reading in turn conflicts with point 3. So neither text matches all the evidence, and only a measurement can settle the edges.
