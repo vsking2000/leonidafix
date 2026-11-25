@@ -770,7 +770,7 @@ def main(argv=None):
     if bad: print(f"unknown opcode(s): {','.join(bad)}", file=sys.stderr); return 2
     if args.list_ops:
         for op in BASE: print(op)
-        print("Excluded (not translated by main): v_fract_f64, v_ldexp_f64, v_mad_f64, v_div_scale_f64")
+        print("Excluded (not translated by main): v_ldexp_f64, v_mad_f64, v_div_scale_f64")
         return 0
     if args.self_test: return 0 if self_test() else 1
     gpu = hw = None

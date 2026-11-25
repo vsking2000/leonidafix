@@ -8816,6 +8816,89 @@ class Gen:
                 out = [emit_u(f"OpCompositeExtract %uint {modified} {index}") for index in range(2)]
             for index in range(2):
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, out[index])
+        elif op == "v_fract_f64":
+            # D.f64 = S0.f64 - floor(S0.f64) (RDNA2 ISA, VOP1 opcode 62), with the edges of v_fract_f32 and
+            # v_fract_f16 (docs/design.md, "v_fract_f64"). Only a finite normal source reaches the driver's Floor;
+            # a NaN, an infinity, a zero and a subnormal are selected from the operand's words.
+            if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n") != 2:
+                raise Unsupported(op + " operands")
+            dst, src = a
+            if (ins["op"].endswith(("_dpp", "_sdwa"))
+                    or any(mod not in ("mul:2", "mul:4", "div:2", "clamp") for mod in mods)
+                    or (ins["op"].endswith("_e32") and (mods or src.get("neg") or src.get("abs")))):
+                raise Unsupported(op + " modifier")
+            if self.round_mode:
+                # x - floor(x) of a negative non-integer is rounded, and whether the instruction follows MODE.FP_ROUND
+                # is not measured; only v_add_f64 models the directed f64 rounding modes (f64_add_mode).
+                raise Unsupported(op + " under a directed MODE.FP_ROUND")
+            self.uses_f64 = True
+            low, high = self.f64_source_words(src, op)
+            if src.get("abs"):
+                mag = self.tmp()
+                self.emit(f"{mag} = OpBitwiseAnd %uint {high} {self.cu(0x7FFFFFFF)}")
+                high = mag
+            if src.get("neg"):
+                negated = self.tmp()
+                self.emit(f"{negated} = OpBitwiseXor %uint {high} {self.cu(0x80000000)}")
+                high = negated
+
+            def emit_u(line):
+                t = self.tmp()
+                self.emit(f"{t} = {line}")
+                return t
+
+            pair = emit_u(f"OpCompositeConstruct %v2uint_d {low} {high}")
+            value = emit_u(f"OpBitcast %double {pair}")
+            floor = emit_u(f"OpExtInst %double %glsl Floor {value}")
+            fract = emit_u(f"OpFSub %double {value} {floor}")
+            # A result that rounded up to 1.0 (a tiny negative source) is the largest double below 1, as for f32/f16.
+            is_one = emit_u(f"OpFOrdEqual %bool {fract} {self.dconst(1.0)}")
+            fract_words = emit_u(f"OpBitcast %v2uint_d {fract}")
+            fract_low = emit_u(f"OpCompositeExtract %uint {fract_words} 0")
+            fract_high = emit_u(f"OpCompositeExtract %uint {fract_words} 1")
+            out_low = emit_u(f"OpSelect %uint {is_one} {self.cu(0xFFFFFFFF)} {fract_low}")
+            out_high = emit_u(f"OpSelect %uint {is_one} {self.cu(0x3FEFFFFF)} {fract_high}")
+            # A zero source (of either sign) gives +0: x - x is +0, but Floor(-0.0) is a zero of either sign by the
+            # language, so a driver returning +0 would make -0 - +0 = -0.
+            magnitude_high = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x7FFFFFFF)}")
+            magnitude_words = emit_u(f"OpBitwiseOr %uint {magnitude_high} {low}")
+            is_zero = emit_u(f"OpIEqual %bool {magnitude_words} {self.cu(0)}")
+            out_low = emit_u(f"OpSelect %uint {is_zero} {self.cu(0)} {out_low}")
+            out_high = emit_u(f"OpSelect %uint {is_zero} {self.cu(0)} {out_high}")
+            exponent = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x7FF00000)}")
+            fraction_high = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x000FFFFF)}")
+            fraction = emit_u(f"OpBitwiseOr %uint {fraction_high} {low}")
+            has_fraction = emit_u(f"OpINotEqual %bool {fraction} {self.cu(0)}")
+            exponent_ones = emit_u(f"OpIEqual %bool {exponent} {self.cu(0x7FF00000)}")
+            exponent_zero = emit_u(f"OpIEqual %bool {exponent} {self.cu(0)}")
+            is_nan = emit_u(f"OpLogicalAnd %bool {exponent_ones} {has_fraction}")
+            no_fraction = emit_u(f"OpLogicalNot %bool {has_fraction}")
+            is_inf = emit_u(f"OpLogicalAnd %bool {exponent_ones} {no_fraction}")
+            is_subnormal = emit_u(f"OpLogicalAnd %bool {exponent_zero} {has_fraction}")
+            sign = emit_u(f"OpBitwiseAnd %uint {high} {self.cu(0x80000000)}")
+            negative = emit_u(f"OpINotEqual %bool {sign} {self.cu(0)}")
+            # A positive subnormal is its own fraction; a negative one gives 1 - tiny, which rounds to 1.0 and so to
+            # the largest double below 1. The words come from the operand, not from the driver's denormal handling.
+            sub_low = emit_u(f"OpSelect %uint {negative} {self.cu(0xFFFFFFFF)} {low}")
+            sub_high = emit_u(f"OpSelect %uint {negative} {self.cu(0x3FEFFFFF)} {high}")
+            out_low = emit_u(f"OpSelect %uint {is_subnormal} {sub_low} {out_low}")
+            out_high = emit_u(f"OpSelect %uint {is_subnormal} {sub_high} {out_high}")
+            # fract(+-inf) is the negative quiet NaN (0xffc00000 measured for f32, 0xfe00 for f16); a NaN's words pass
+            # through unchanged.
+            out_low = emit_u(f"OpSelect %uint {is_inf} {self.cu(0)} {out_low}")
+            out_high = emit_u(f"OpSelect %uint {is_inf} {self.cu(0xFFF80000)} {out_high}")
+            out_low = emit_u(f"OpSelect %uint {is_nan} {low} {out_low}")
+            out_high = emit_u(f"OpSelect %uint {is_nan} {high} {out_high}")
+            out = [out_low, out_high]
+            # A binary64 result ignores mul:2/mul:4/div:2 while denorm_mode_16_64 = 3, the game's MODE
+            # (tools/f64_omod_probe.py; docs/design.md, "v_add_f64 output modifiers"), and takes clamp.
+            if "clamp" in mods:
+                chosen_pair = emit_u(f"OpCompositeConstruct %v2uint_d {out[0]} {out[1]}")
+                chosen = emit_u(f"OpBitcast %double {chosen_pair}")
+                clamped = emit_u(f"OpBitcast %v2uint_d {self.clamp_mods_f64(chosen, ['clamp'])}")
+                out = [emit_u(f"OpCompositeExtract %uint {clamped} {index}") for index in range(2)]
+            for index in range(2):
+                self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, out[index])
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
