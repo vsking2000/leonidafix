@@ -23,3 +23,30 @@ finding: `tests/semantic/test_valu_fract_f64.py` checks a Python model of v_frac
 Where: `tests/semantic/test_valu_fract_f64.py:154-215` (`oracle_v_fract_f64`). Why it matters: the file never imports `rdna2spirv` or `support`, so it passes whatever the translator does (the TEST-545 "mock oracle" pattern); its docstring says the clamp-to-0x3fefffffffffffff rule matches "hardware behavior documented in docs/design.md", but `docs/design.md` had no `v_fract_f64` row before SHADER-FRACT-F64 and nothing measures the binary64 form. It also pins two edges that the measured `v_fract_f32`/`v_fract_f16` rows contradict: fract(+-inf) is the positive canonical quiet NaN `0x7ff8000000000000` there (the measured f32 word is the negative `0xffc00000`, f16 `0xfe00`), and a signalling NaN is quieted (measured f32: unchanged, IEEE = 0). Fix: after SHADER-FRACT-F64 lands, replace it with tests through `support.translate_lines` (or delete it), and settle the two edges with a `tools/hw_oracle` run. Needs hardware: only for the two edges.
 
 Addendum to the `test_valu_fract_f64.py` finding (after the SHADER-FRACT-F64 review): the file now contradicts the new `v_fract_f64` row of `docs/design.md` on the same two edges (positive canonical NaN for +-inf; a signalling NaN quieted), `tests/test_semantic_translator_use.py` still lists it in `DEBT` ("private oracle ... should translate a listing"), and the new translator test `tests/semantic/test_fract_f64.py` already covers everything it models. Its finite, cap, signed-zero and subnormal words do agree with LLVM's constant fold (`llvm/test/Transforms/InstSimplify/ConstProp/AMDGPU/fract.ll`, f64). Fix: delete the file and its `DEBT` entry once SHADER-FRACT-F64 is on main (the two NaN edges are covered, as measured for f32/f16, by `test_fract_f64.py`). Needs no hardware or game files.
+
+
+---
+
+finding: `s_movreld_b32`, `s_movreld_b64` and `s_movrelsd_2_b32` (relative SGPR writes through M0) cannot be translated yet: no public source says what a write does when `D + M0` lands past s105 (VCC, M0, EXEC, ...) or past the SGPR file, and M0 is not known at translation time.
+
+**Where:** `tools/rdna2spirv.py` line 12490 on upstream/main `b4b7756e` (the generic `raise Unsupported(op)`; all three ops reach it by name). The comment at line 9473 in the `s_movrels` branch explains why the writes stay refused. **Needs:** a GFX10 GPU (gfx1035/gfx1036) running `tools/int_hw_probe.py`. No game files.
+
+**What the sources settle** (ISA pseudocode in the RDNA3, RDNA4 and CDNA3 wording, as extracted in tinygrad's `tinygrad/runtime/autogen/amd/*/str_pcode.py`; the RDNA2 wording was not read; plus the repo's `s_movrels` and `v_movrel*` rows in `docs/design.md`):
+- index = DST + M0, all 32 bits of M0 (text; the `s_movrels` rule uses the same whole M0);
+- `s_movrelsd_2_b32`: source + M0[9:0], destination + M0[25:16] (RDNA3/RDNA4 text; CDNA has no such op; `v_movrelsd_2_b32` uses the same fields);
+- `_b64` writes the pair at addr and addr + 1 (text `SGPR[addr].b64`; the `s_movrels_b64` rule reads that pair);
+- SCC: the text is silent; the `s_movrels` rule leaves it alone (hardware-verified for the read on gfx1035, SHADER-137).
+
+**The edge neither settles:** a write whose index lands past s105 or past the SGPR file. The text is silent. The `s_movrels` row lists "reads past s105 landing on VCC and the other special registers" as not modelled, and its index wraps `& 127` into the 128-slot array, which for a write would corrupt a low SGPR. The `v_movrel*` drop-out-of-range rule (RDNA2 ISA §3.6.1) is stated for VGPRs only. This cannot be decided at translation time: M0 is the `%m0` variable and the translator keeps no M0 constant.
+
+**Cases that would settle it:** add to `tools/int_hw_probe.py` group 9 (next to `salu_movrels`, same `_salu32_pair` / `_salu64_case` helpers). Each case presets s4 = 0x5A5A5A5A, VCC = 0x11111111/0x22222222, EXEC as the harness has it, and a sentinel in s0..s3. Afterwards it reads back the target, VCC_LO/HI, M0, EXEC_LO and s0 through v8..v11 (as many runs as the four output words need).
+- `s_movreld_b32 s100, s4` with M0 = 5, 6, 7, 24, 26 and 28: D + M0 = 105, 106 (VCC_LO), 107 (VCC_HI), 124 (M0 itself), 126 (EXEC_LO) and 128 (past the encoding space);
+- `s_movreld_b64 s[100:101], s[4:5]` with M0 = 5 (straddles s105/s106) and 6;
+- `s_movrelsd_2_b32 s100, s4` with M0 = (6 << 16) | 0 and (5 << 16) | 103;
+- an in-range control with SCC preset to 0 and to 1: `s_movreld_b32 s10, s4` with M0 = 2.
+
+**Partial audit for whoever implements the translation** (verified so far; not exhaustive):
+- `tools/rdna2spirv.py` keeps SGPR-keyed state: `sgpr_imm` (line ~403), `desc_cache` (~404), `x_tok` (~371) and `cur_masks` (fed by `lane_masks.py`). `store_reg` drops `sgpr_imm`, `x_tok` and `desc_cache` only for the one register it writes. A dynamic write must drop them for every SGPR at or above D and handle lane-mask SGPRs as `s_movrels` does for reads.
+- `tools/lane_masks.py` already handles all three ops (`SGPR_REL_DST`, line 51) by dropping every tracked mask key at or above D (lines 192-197).
+- `tools/wave64_halves.py` handles `s_movrels` reads (lines 98, 1010, 1780) but has no relative-SGPR-write case; it would need one like its `v_movreld` handling (lines 503 and 1036).
+- Not yet checked for SGPR-keyed state: `tools/shader_meta.py`, `tools/wave64_emulate_opt.py`, `tools/feature_scan.py`, `tools/image_bvh_census.py`, `tools/sampler_source_census.py`, `scripts/audit_shader4_regs.py`, `tools/vrel_diff.py`, `tools/salu_diff.py`, `tools/spirv_opt.py`.

@@ -2,9 +2,10 @@ finding: `v_div_scale_f32`/`v_div_scale_f64` cannot be translated from public so
 
 **Where:** `tools/rdna2spirv.py` line 12447 (upstream/main `6558d53`), the generic `raise Unsupported(op)` at the end of the VALU dispatch; both ops reach it by name. **Needs:** an RDNA2 GPU (gfx1036 is enough) running `tools/hw_oracle` in the game MODE (`ieee=0`, `dx10_clamp=1`, `denorm32=0`, `denorm16_64=3`), wave32 and wave64. No game files. **Why it matters:** the game does not use the op (all its shaders translate), but it is the first step of the AMD IEEE divide (`div_scale` x2, `rcp`, fmas, `v_div_fmas`, `v_div_fixup`), and a rule written from the document text would be wrong (see the last point).
 
-**Probe matrix** (record D and the VCC bit for each call; f32 thresholds first, f64 in brackets; run each pair as both the denominator call `(S1, S1, S2)` and the numerator call `(S2, S1, S2)`, plus `S0 == S1 == S2`):
+**Probe matrix** (preset D to a sentinel no candidate can produce before each call, so that a D that is not written shows; record D and the VCC bit for each call; f32 thresholds first, f64 in brackets; run each pair as both the denominator call `(S1, S1, S2)` and the numerator call `(S2, S1, S2)`, plus `S0 == S1 == S2`):
 - zero S1, zero S2, +-0, both zero; inf and NaN (quiet and signalling) in each source
 - denormal S1, denormal S2, denormal S0 (does `denorm32=0` flush them before the tests?)
+- a denormal S1 under a mid-range numerator, with an exponent gap below 96 [768] (2^-60 / smallest denormal [2^-284 / smallest denormal]): the only way to reach the denormal-S1 branch without the gap branch taking it first
 - exponent gap `exp(S2) - exp(S1)` = 95 / 96 / 97 [767 / 768 / 769]
 - |S1| just below and above 2^126 [2^1022] (where 1/S1 becomes denormal), with the quotient normal and with it denormal
 - quotient just above, exactly at and below the smallest normal 2^-126 [2^-1022] (e.g. `2^-126 / 1.0`)
