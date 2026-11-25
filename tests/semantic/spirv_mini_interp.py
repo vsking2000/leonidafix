@@ -1011,6 +1011,13 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             converted = float(_s32(x) if op == "OpConvertSToF" else x)
             # Python's binary64 float holds every 32-bit integer exactly.
             values[res] = converted if types.t[a[0]] == ("float", 64) else f32(converted)
+        elif op == "OpFConvert":
+            # Between binary32 and binary64 (v_cvt_f64_f32, v_cvt_f32_f64). A binary32 value is held as the Python
+            # float with the same value, so widening is exact; narrowing rounds to nearest even (f32()).
+            x = val(a[1])
+            if not isinstance(x, float) or types.t.get(a[0]) not in (("float", 32), ("float", 64)):
+                raise UnsupportedConstruct("OpFConvert other than between binary32 and binary64")
+            values[res] = x if types.t[a[0]] == ("float", 64) else f32(x)
         elif op == "OpBitCount":
             # Every bit of the operand counts: its width, not the result's (a 64-bit operand with a 32-bit result).
             t = types.t.get(id_type.get(a[1]))

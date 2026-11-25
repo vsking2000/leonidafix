@@ -6805,6 +6805,116 @@ class Gen:
             self.emit(f"{word} = OpCompositeExtract %uint {pair} {i}")
             self.dst({"k": "vgpr", "r": d["r"] + i, "n": 1}, word)
 
+    def src_f64(self, sv, op, raw_sign=False):
+        """A register pair or constant source as a %double (sets nothing: the caller sets uses_f64), with the VOP3
+        abs then neg source modifiers applied to the double. With raw_sign they are moves of the sign bit in the
+        high word instead of OpFAbs/OpFNegate, which a driver may use to quiet a signalling NaN: v_min/v_max_f64 use
+        that, as the f32/f16 min/max do (src_f_sign_mods)."""
+        lo, hi = self.f64_source_words(sv, op)
+        if raw_sign:
+            if sv.get("abs"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseAnd %uint {hi} {self.cu(0x7FFFFFFF)}")
+                hi = t
+            if sv.get("neg"):
+                t = self.tmp()
+                self.emit(f"{t} = OpBitwiseXor %uint {hi} {self.cu(0x80000000)}")
+                hi = t
+        v2, d = self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
+        self.emit(f"{d} = OpBitcast %double {v2}")
+        if raw_sign:
+            return d
+        if sv.get("abs"):
+            t = self.tmp()
+            self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
+            d = t
+        if sv.get("neg"):
+            t = self.tmp()
+            self.emit(f"{t} = OpFNegate %double {d}")
+            d = t
+        return d
+
+    F64_VALU_OPS = ("v_mul_f64", "v_fma_f64", "v_min_f64", "v_max_f64",
+                    "v_cvt_f64_f32", "v_cvt_i32_f64", "v_cvt_u32_f64")
+
+    def f64_valu(self, op, a, mods):
+        """The binary64 VALU ops of F64_VALU_OPS (RDNA2 ISA VOP3 opcodes 0x165, 0x14C, 0x166, 0x167 and VOP1 0x10,
+        0x03, 0x15; docs/design.md, "Binary64 multiply, FMA, min/max and conversions").
+
+        - v_mul_f64: S0 * S1, one rounding. v_fma_f64: S0 * S1 + S2, one rounding (emit_fma64).
+        - v_min_f64/v_max_f64: as the measured f32 rule ("Float min/max/med3 with NaN"): one NaN operand gives the
+          other operand, two give S0 (its bits, the source sign modifiers applied as sign-bit moves). The f64 forms
+          are not measured, nor is the order of -0 and +0, which follows the f32 rule.
+        - v_cvt_f64_f32: exact widening of the f32 source. Under the game's MODE (f32 denormals flushed) a denormal
+          source reads as a zero of its sign: by analogy with the f32 denormal-input rule of the measured
+          v_floor/v_ceil/v_fract_f32, NOT measured for this conversion.
+        - v_cvt_i32_f64/v_cvt_u32_f64: truncate toward zero, saturate out-of-range values and infinities, NaN -> 0
+          (ISA description, not GPU-checked), as v_cvt_i32_f32/v_cvt_u32_f32 do.
+
+        Output modifiers: only `clamp` reaches the f64 result (dst_f64). The omod (mul:2, mul:4, div:2) is accepted
+        and ignored, because an f64 result ignores it while f64 denormals are kept, the game's MODE: the
+        per-result-precision gate of tools/f64_omod_probe.py, measured on gfx1036 for v_cvt_f64_i32/u32,
+        v_frexp_mant_f64 and v_div_fixup_f64 and not measured for these ops. The integer results take no output
+        modifier (refused). A program that changes MODE.FP_ROUND is refused for v_mul/v_fma_f64: only v_add_f64
+        models the directed f64 rounding modes (f64_add_mode)."""
+        float_dst = op not in ("v_cvt_i32_f64", "v_cvt_u32_f64")
+        nsrc = {"v_fma_f64": 3, "v_mul_f64": 2, "v_min_f64": 2, "v_max_f64": 2}.get(op, 1)
+        if len(a) != nsrc + 1:
+            raise Unsupported(op + " operands")
+        for m in mods:
+            if not float_dst or m not in ("clamp", "mul:2", "mul:4", "div:2") or mods.count(m) > 1:
+                raise Unsupported(op + " modifier " + m)
+        if sum(m != "clamp" for m in mods) > 1:
+            raise Unsupported(op + " duplicate output modifier")
+        if op in ("v_mul_f64", "v_fma_f64") and self.round_mode:
+            raise Unsupported(op + " under a directed MODE.FP_ROUND")
+        self.uses_f64 = True
+        if op == "v_cvt_f64_f32":
+            src = a[1]
+            if src.get("n", 1) != 1:
+                raise Unsupported(op + " source")
+            x = self.flush_f32(self.src_f(src))
+            r = self.tmp()
+            self.emit(f"{r} = OpFConvert %double {x}")
+            self.dst_f64(a[0], r, [m for m in mods if m == "clamp"], op)
+            return
+        minmax = op in ("v_min_f64", "v_max_f64")
+        srcs = [self.src_f64(sv, op, raw_sign=minmax) for sv in a[1:]]
+        if op in ("v_cvt_i32_f64", "v_cvt_u32_f64"):
+            d = a[0]
+            if d["k"] != "vgpr" or d.get("n", 1) != 1:
+                raise Unsupported(op + " destination")
+            x = srcs[0]
+            lo, hi = ((-2147483648.0, 2147483647.0) if op == "v_cvt_i32_f64" else (0.0, 4294967295.0))
+            nan, safe, cl, conv = (self.tmp() for _ in range(4))
+            self.emit(f"{nan} = OpIsNan %bool {x}")
+            self.emit(f"{safe} = OpSelect %double {nan} {self.dconst(0.0)} {x}")
+            # Both bounds are exact doubles, so clamping before the truncating conversion saturates and keeps the
+            # conversion's operand in range (out of range it is undefined in SPIR-V).
+            self.emit(f"{cl} = OpExtInst %double %glsl FClamp {safe} {self.dconst(lo)} {self.dconst(hi)}")
+            if op == "v_cvt_i32_f64":
+                si = self.tmp()
+                self.emit(f"{si} = OpConvertFToS %int {cl}")
+                self.emit(f"{conv} = OpBitcast %uint {si}")
+            else:
+                self.emit(f"{conv} = OpConvertFToU %uint {cl}")
+            self.dst(d, conv)
+            return
+        r = self.tmp()
+        if op == "v_mul_f64":
+            self.emit(f"{r} = OpFMul %double {srcs[0]} {srcs[1]}")
+        elif op == "v_fma_f64":
+            self.emit_fma64(r, *srcs)
+        else:
+            x, y = srcs
+            nmm, nan_y, sel = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{nmm} = OpExtInst %double %glsl {'NMin' if op == 'v_min_f64' else 'NMax'} {x} {y}")
+            self.emit(f"{nan_y} = OpIsNan %bool {y}")
+            self.emit(f"{sel} = OpSelect %double {nan_y} {x} {nmm}")
+            r = sel
+        self.dst_f64(a[0], r, [m for m in mods if m == "clamp"], op)
+
     def flush_f32_mods(self, v, mods):
         """Flush a subnormal sum before output modifiers and flush again after them (SHADER-340, RDNA1 gfx1010)."""
         v = self.flush_f32(v)
@@ -8554,19 +8664,7 @@ class Gen:
         elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
-                lo, hi = self.f64_source_words(sv, op)
-                v2, d = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
-                self.emit(f"{d} = OpBitcast %double {v2}")
-                if sv.get("abs"):
-                    t = self.tmp()
-                    self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
-                    d = t
-                if sv.get("neg"):
-                    t = self.tmp()
-                    self.emit(f"{t} = OpFNegate %double {d}")
-                    d = t
-                return d
+                return self.src_f64(sv, op)
             self.uses_f64 = True
             if op == "v_cvt_f32_f64":
                 x = f64(a[1])
@@ -8602,6 +8700,8 @@ class Gen:
                     self.emit(f"{r} = OpExtInst %double %glsl Sqrt {x}")
                 # VOP3 f64 ops carry HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
                 self.dst_f64(a[0], r, mods, op)
+        elif op in self.F64_VALU_OPS:
+            self.f64_valu(op, a, mods)
         elif op in ("v_cmp_class_f64", "v_cmpx_class_f64"):
             self.cmp_class_f64(op, a, exec_only=op == "v_cmpx_class_f64", mods=mods)
         elif op in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
