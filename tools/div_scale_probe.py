@@ -1,7 +1,7 @@
 r"""Measure v_div_scale_f32 and v_div_scale_f64 (D and the per-lane flag) on RDNA2 hardware. Standard library only.
 
 The translator refuses both ops: the public descriptions of them disagree at the edges, and nothing has been measured
-on RDNA2 (docs/design.md, "v_div_scale_f32, v_div_scale_f64"). This probe runs hand-written kernels on a GFX10 GPU
+on RDNA2 (docs/shader_validation.md, "v_div_scale on the hardware"). This probe runs hand-written kernels on a GFX10 GPU
 through tools/hw_oracle and records, for every case, the destination D and the flag the op writes to its scalar mask
 destination. Next to each measured row it prints what three candidate readings predict, so a run shows at once which
 reading (if any) the hardware follows. The candidates are references written here from public sources; none of them
@@ -10,14 +10,23 @@ is known to be right:
 * ``isa_newer``: the ISA pseudocode as worded in the RDNA3, RDNA4 and CDNA3 documents. Its f32 form classifies
   ``1.0 / S1`` as a binary64 value (``1.0 / 64'F(S1.f32) == DENORM.f64``), which no f32 S1 satisfies, so the two
   "reciprocal is denormal" branches never fire for f32.
-* ``isa_recip_width``: the same text with ``1.0 / S1`` classified in the operand's own width, as older emulators
-  transcribe it. It differs from ``isa_newer`` for f32 only.
+* ``isa_recip_width``: the same text with ``1.0 / S1`` classified in the operand's own width. It differs from
+  ``isa_newer`` for f32 only. (The public emulators of the older instruction sets classify with "not normal" instead
+  of "== DENORM", which also differs for a zero, infinite or NaN reciprocal and for a quotient that underflows to
+  zero. No candidate models that; the matrix has rows that tell it apart, e.g. ``1 / inf`` and, for f32,
+  ``2^-126 / 2^30``.)
 * ``rdna3_emu``: the rule tinygrad's RDNA3 emulator runs after its hand-written fixes, read from
   ``test/mockgpu/amd/emu.py`` (``_fix_div_scale``) in the tinygrad project. Its hardware tests
   (``test/amd/hw/test_vop3.py``) pin it at a few points only.
 
-The ISA text assigns D in no branch for ordinary operands; all three take D = S0 there, which is what LLVM's divide
-lowering (``SIISelLowering.cpp``, ``LowerFDIV32``/``LowerFDIV64``) relies on. Where a candidate gives NaN, any NaN
+"D = S0 where no branch assigns it" is an assumption, applied identically in all three candidates: for ordinary
+operands, and inside every taken branch that assigns nothing (the gap branch when S0 != S1, the quotient branch when
+S0 != S2). It is what LLVM's divide lowering (``SIISelLowering.cpp``, ``LowerFDIV32``/``LowerFDIV64``) relies on, and
+it is not measured. Every ``v_div_scale`` of the plain and modifier rows is preceded by a write of a sentinel to D
+(``SENTINEL``; no operand of the matrix and no candidate prediction equals it), so a run shows whether D is written at
+all: a row that reads the sentinel back is reported as ``d_unwritten``. One public emulator initialises D
+differently, as a note and not as a candidate: yoshou's amdgpu-sim (``gcn_processor.rs``) starts from
+``D = S0 * S2 / S1``; gem5's f64 model assigns D only in the branches that scale. Where a candidate gives NaN, any NaN
 matches, since none of them fixes the payload. The candidates ignore MODE (they read the operand bits as given), so
 a mode that flushes denormal inputs shows up as rows no candidate matches.
 
@@ -25,7 +34,9 @@ Cases, per width (f32 thresholds first, f64 in brackets), for numerator n and de
 
 * 11 special pairs: zero, negative zero and both-zero; inf in either source and in both; quiet and signalling NaN in
   either source;
-* 5 denormal pairs: the smallest and largest denormal as d and as n, and denormal over denormal;
+* 6 denormal pairs: the smallest and largest denormal as d and as n, denormal over denormal, and the smallest
+  denormal under a mid-range n (2^-60 [2^-284], biased exponent field 67 [739]: a gap below 96 [768], so the
+  denormal-S1 branch is reached and the gap branch is not);
 * 6 exponent-gap pairs, biased exponent field of n minus that of d = 95, 96, 97 [767, 768, 769], once with powers
   of two and once with mantissas 1.5 / 1.75;
 * 8 reciprocal pairs: d = the value below 2^126 [2^1022], 2^126 [2^1022] itself, the value above it, and
@@ -37,10 +48,10 @@ Cases, per width (f32 thresholds first, f64 in brackets), for numerator n and de
 * 7 ordinary pairs: 1/4, 2/4, 3/7, -5.5/1.25, 1e10/3e-5, -1.0 / the value above 2^126 [2^1022], 1.0 / -2^127
   [-2^1023].
 
-That is 48 pairs. Each runs as the denominator call ``(S0, S1, S2) = (d, d, n)`` and as the numerator call
+That is 49 pairs. Each runs as the denominator call ``(S0, S1, S2) = (d, d, n)`` and as the numerator call
 ``(n, d, n)``, the two calls of LLVM's lowering, with S0 the same register as S1 or S2. There are also 10 cases with
 S0 = S1 = S2: 1.0, 3.0, a tiny normal (biased exponent 22 [52]), the smallest normal, the largest denormal, +0,
-2^127 [2^1023], the largest finite value, +inf and a quiet NaN. That makes 106 rows per width. Each row runs twice,
+2^127 [2^1023], the largest finite value, +inf and a quiet NaN. That makes 108 rows per width. Each row runs twice,
 once with the mask written to VCC and once to an SGPR (s10, or s[10:11] in wave64). The register is preset to all
 ones, so both a cleared bit and the bits of inactive lanes are visible.
 
@@ -49,10 +60,11 @@ with ``neg`` on S0, S1 and S2, and with ``clamp``, ``mul:2`` and ``div:2``, whic
 rows are compared with the candidates on the negated operands. The clamp and omod rows are only recorded: the text
 says nothing about them. VOP3B has no ``abs``.
 
-Divide sequence: each of the 48 pairs also runs through LLVM's whole divide (``v_div_scale`` twice, ``v_rcp``, the
-FMAs, ``v_div_fmas``, ``v_div_fixup``) without the s_denorm_mode switch LLVM wraps around the f32 form. The final
-quotient is compared with the correctly rounded IEEE quotient, and with that quotient flushed to zero when it is
-denormal.
+Divide sequence: each of the 49 pairs also runs through LLVM's whole divide (``v_div_scale`` twice, ``v_rcp``, the
+FMAs, ``v_div_fmas``, ``v_div_fixup``) without the s_denorm_mode switch LLVM wraps around the f32 form, so the f32
+sequence is comparable with LLVM's lowering only in the MODE that keeps f32 denormals (``i0_d3_f32keep``); the
+summary labels the other f32 tallies. The final quotient is compared with the correctly rounded IEEE quotient, and
+with that quotient flushed to zero when it is denormal.
 
 All of it runs in wave32 and wave64 under five MODEs (the f64_omod_probe set, game MODE first), one lane per wave.
 
@@ -85,6 +97,10 @@ MODES = {
     "i0_d3_f32keep": {"round16_64": 0, "denorm16_64": 3, "denorm32": 3, "dx10_clamp": 1, "ieee": 0},
 }
 WIDTHS = ("f32", "f64")
+# Written to D (both words for f64) before every v_div_scale of the plain and modifier kernels. It is a finite normal
+# value with different words, so a D that is not written, or half written, reads back as itself; sentinel_conflicts()
+# checks that no operand and no candidate prediction of the matrix equals it.
+SENTINEL = {"f32": 0x5EADBEEF, "f64": 0x5EADBEEFCAFEF00D}
 CANDIDATES = ("isa_newer", "isa_recip_width", "rdna3_emu")
 NAN = "nan"   # a predicted NaN: any NaN matches
 
@@ -307,7 +323,8 @@ def pairs(f):
            ("inf / 1", inf, one), ("1 / inf", one, inf), ("inf / inf", inf, inf),
            ("qnan / 1", qnan, one), ("1 / qnan", one, qnan), ("snan / 1", snan, one), ("1 / snan", one, snan),
            ("1 / min denorm", one, dmin), ("1 / max denorm", one, dmax),
-           ("min denorm / 1", dmin, one), ("max denorm / 1", dmax, one), ("max denorm / min denorm", dmax, dmin)]
+           ("min denorm / 1", dmin, one), ("max denorm / 1", dmax, one), ("max denorm / min denorm", dmax, dmin),
+           (f"2^{f.gap - 29 - f.bias} / min denorm", pow2(f, f.gap - 29 - f.bias), dmin)]
     for g in (f.gap - 1, f.gap, f.gap + 1):
         out.append((f"gap {g}: 2^{g} / 1", pow2(f, g), one))
     for g in (f.gap - 1, f.gap, f.gap + 1):
@@ -375,6 +392,23 @@ def predict(f, s0, s1, s2):
     return {c: READINGS[c](f, s0, s1, s2) for c in CANDIDATES}
 
 
+def sentinel_conflicts(f):
+    """Rows (plain and modifier, neg forms included) where the D sentinel equals an operand or a predicted D."""
+    sentinel, bad = SENTINEL[f.name], []
+    rows = [(case + " " + call, (s0, s1, s2)) for case, call, s0, s1, s2 in scale_rows(f)]
+    for case, form, n, d in mod_rows(f):
+        ops = [n, d, n]
+        if form.startswith("-s"):
+            ops[int(form[2])] = neg(f, ops[int(form[2])])
+        rows.append((f"{case} {form}", tuple(ops)))
+    if is_nan(f, sentinel) or is_inf(f, sentinel) or is_denorm(f, sentinel):
+        bad.append("the sentinel is not a finite normal value")
+    for name, ops in rows:
+        if sentinel in ops or any(pred[0] == sentinel for pred in predict(f, *ops).values()):
+            bad.append(name)
+    return bad
+
+
 # ---- kernels ----
 
 def _reg(f, base):
@@ -432,7 +466,7 @@ def scale_kernel_lines(f, wave):
             else:
                 w.lines += _seed(f, 2, s1) + _seed(f, 4, s2)
                 ops = (den, den, num) if call == "den" else (num, den, num)
-            w.lines += [preset, _div_scale_line(f, sdst, *ops)]
+            w.lines += _seed(f, 8, SENTINEL[f.name]) + [preset, _div_scale_line(f, sdst, *ops)]
             for k in range(f.words):
                 w.store(f"v{8 + k}")
             for r in reads:
@@ -453,7 +487,8 @@ def mod_kernel_lines(f, wave):
             ops[i] = "-" + ops[i]
         else:
             tail = " " + form
-        w.lines += _seed(f, 2, d) + _seed(f, 4, n) + [preset, _div_scale_line(f, sdst, *ops, tail)]
+        w.lines += _seed(f, 2, d) + _seed(f, 4, n) + _seed(f, 8, SENTINEL[f.name]) + \
+            [preset, _div_scale_line(f, sdst, *ops, tail)]
         for k in range(f.words):
             w.store(f"v{8 + k}")
         for r in reads:
@@ -542,6 +577,7 @@ def evaluate(meta, raw_results):
 
     rows, seq_rows = [], []
     summary = {"candidates": {}, "wave_diffs": 0, "dst_diffs": 0, "first_wave_diffs": [], "first_dst_diffs": [],
+               "d_unwritten": 0, "first_d_unwritten": [],
                "first_mismatches": {c: [] for c in CANDIDATES}, "sequence": {}}
     for (wave, mode_name, width, section) in meta:
         f = FMTS[width]
@@ -579,6 +615,15 @@ def evaluate(meta, raw_results):
                            "cr_ftz" if got == ftz else "other")
                 seq_rows.append({"wave": wave, "mode": mode_name, "width": width, "case": name, "n": n, "d": d,
                                  "q": got, "cr": cr, "verdict": verdict})
+
+    for r in rows:
+        r["unwritten"] = r["d"] == SENTINEL[r["width"]]
+        if r["unwritten"]:
+            summary["d_unwritten"] += 1
+            if len(summary["first_d_unwritten"]) < 5:
+                summary["first_d_unwritten"].append(
+                    f"w{r['wave']} {r['mode']} {r['width']} {r['dst']} {r['case']} ({r['call']}"
+                    f"{' ' + r['form'] if r['form'] else ''})")
 
     # Candidates: the primary rows are the smaller wave's, VCC destination (the SGPR and other-wave rows must agree).
     key = lambda r: (r["mode"], r["width"], r["dst"], r["case"], r["call"], r["form"])  # noqa: E731
@@ -626,8 +671,10 @@ def evaluate(meta, raw_results):
     for s in seq_rows:
         if s["wave"] != first_wave[(s["mode"], s["width"])]:
             continue
-        tally = summary["sequence"].setdefault(f"{s['mode']} {s['width']}", {"cr": 0, "cr_ftz": 0, "nan": 0,
-                                                                             "other": 0, "first_other": []})
+        # LLVM wraps the f32 FMAs in an s_denorm_mode switch that these kernels do not have.
+        comparable = s["width"] != "f32" or MODES[s["mode"]]["denorm32"] == 3
+        tally = summary["sequence"].setdefault(f"{s['mode']} {s['width']}", {
+            "cr": 0, "cr_ftz": 0, "nan": 0, "other": 0, "first_other": [], "llvm_comparable": comparable})
         tally[s["verdict"]] += 1
         if s["verdict"] == "other" and len(tally["first_other"]) < 5:
             f = FMTS[s["width"]]
@@ -639,7 +686,8 @@ def row_json(r):
     f = FMTS[r["width"]]
     out = {k: r[k] for k in ("wave", "mode", "width", "dst", "case", "call", "form")}
     out.update({"s0": _hex(f, r["s0"]), "s1": _hex(f, r["s1"]), "s2": _hex(f, r["s2"]), "d": _hex(f, r["d"]),
-                "mask": [f"{m:08x}" for m in r["mask"]], "flag": r["mask"][0] & 1})
+                "d_unwritten": r["unwritten"], "mask_lo": f"{r['mask'][0]:08x}",
+                "mask_hi": f"{r['mask'][1]:08x}" if len(r["mask"]) > 1 else None, "flag": r["mask"][0] & 1})
     if r["pred"] is not None:
         out["candidates"] = {c: {"d": _hex(f, r["pred"][c][0]), "flag": r["pred"][c][1],
                                  "match": _match(f, r["pred"][c][0], r["d"]) and r["pred"][c][1] == (r["mask"][0] & 1)}
@@ -653,15 +701,22 @@ def seq_json(s):
             "d": _hex(f, s["d"]), "q": _hex(f, s["q"]), "correctly_rounded": _hex(f, s["cr"]), "verdict": s["verdict"]}
 
 
+TABLE_LEGEND = ("# columns: wave mode width mask-destination call modifier case D=<result, hex without 0x, high word "
+                "first, or <unwritten> when the D sentinel was read back> flag=<bit 0 of the mask, lane 0> then, "
+                "per candidate, ok (predicts D and flag) or x. The --json file also has the whole mask words "
+                "(mask_lo, then mask_hi in wave64).")
+
+
 def table_lines(rows):
-    out = []
+    out = [TABLE_LEGEND]
     for r in rows:
         f = FMTS[r["width"]]
         cands = "" if r["pred"] is None else "  " + "  ".join(
             f"{c}={'ok' if _match(f, r['pred'][c][0], r['d']) and r['pred'][c][1] == r['mask'][0] & 1 else 'x'}"
             for c in CANDIDATES)
         out.append(f"w{r['wave']} {r['mode']} {r['width']} {r['dst']:4} {r['call']:4} {r['form'] or '-':6} "
-                   f"{r['case']:28} D={_hex(f, r['d'])} flag={r['mask'][0] & 1}{cands}")
+                   f"{r['case']:28} D={'<unwritten>' if r['unwritten'] else _hex(f, r['d'])} "
+                   f"flag={r['mask'][0] & 1}{cands}")
     return out
 
 
@@ -688,6 +743,8 @@ def self_test():
     for f in (f32, f64):
         for c in CANDIDATES:
             assert READINGS[c](f, pow2(f, 1), pow2(f, 2), pow2(f, 1)) == (pow2(f, 1), 0), (f.name, c)
+    for f in (f32, f64):
+        assert not sentinel_conflicts(f), (f.name, sentinel_conflicts(f))
     rows = sum(len(scale_rows(f)) for f in (f32, f64))
     print(f"self-test ok ({len(CANDIDATES)} candidates, {rows} rows over 2 widths, {len(MODES)} modes)")
     return 0
@@ -763,17 +820,27 @@ def main(argv=None) -> int:
         print(f"{group}: " + ", ".join(f"{c} {ok}/{n}" for c, (ok, n) in tally.items()) +
               "  (rows whose D and flag the candidate predicts)")
     for group, t in summary["sequence"].items():
-        print(f"{group} divide sequence: cr={t['cr']}, cr_ftz={t['cr_ftz']}, nan={t['nan']}, other={t['other']}")
+        label = "" if t["llvm_comparable"] else \
+            "  [f32 sequence without LLVM's s_denorm_mode switch: not comparable with LLVM's lowering in this MODE]"
+        print(f"{group} divide sequence: cr={t['cr']}, cr_ftz={t['cr_ftz']}, nan={t['nan']}, other={t['other']}{label}")
         for line in t["first_other"]:
             print(f"  OTHER {group} {line}")
     for c in CANDIDATES:
         for line in summary["first_mismatches"][c]:
             print(f"  {c} MISMATCH {line}")
+    print(f"d_unwritten={summary['d_unwritten']} (rows that read the D sentinel back: D was not written)")
+    for line in summary["first_d_unwritten"]:
+        print(f"  D UNWRITTEN {line}")
     print(f"wave_diffs={summary['wave_diffs']}, dst_diffs={summary['dst_diffs']}")
     for line in summary["first_wave_diffs"]:
         print(f"  WAVE DIFF {line}")
     for line in summary["first_dst_diffs"]:
         print(f"  DST DIFF {line}")
+    if any(not t["llvm_comparable"] for t in summary["sequence"].values()):
+        print("note: the f32 divide sequence has no s_denorm_mode switch; its verdicts are comparable with LLVM's "
+              "lowering only in i0_d3_f32keep.")
+    if not args.json:
+        print("note: this summary is not the measurement. Re-run with --json <file> and post that file.")
     return 1 if (summary["wave_diffs"] or summary["dst_diffs"]) else 0
 
 
