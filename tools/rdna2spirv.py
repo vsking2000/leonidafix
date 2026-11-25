@@ -7747,7 +7747,8 @@ class Gen:
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
-                    "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
+                    "image_gather4_lz_o", "image_gather4_l_o") or op in self.SAMPLE_GRAD_FORMS or \
+                op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             self._validate_unary_f16(op, ins["op"], a, mods)
@@ -12817,6 +12818,12 @@ class Gen:
         for i, word in enumerate(words):
             self.dst({"k": "vgpr", "r": first_vgpr + i, "n": 1}, word)
 
+    # Explicit-gradient samples combined with a depth compare and/or a texel offset (SHADER-SAMPLE-GRAD-FORMS). GFX10
+    # MIMG address order: offset, z-compare, gradients (dP/dx, then dP/dy), coordinates, clamp (LLVM
+    # IntrinsicsAMDGPU.td AMDGPUSampleVariants and SIISelLowering lowerImage; Mesa ACO's tex selection, the same).
+    SAMPLE_GRAD_FORMS = ("image_sample_c_d", "image_sample_c_d_cl", "image_sample_d_o", "image_sample_d_cl_o",
+                         "image_sample_c_d_o", "image_sample_c_d_cl_o")
+
     GATHER4_LOD_OPS = (
         "image_gather4_c_l", "image_gather4_c_l_o",
         "image_gather4_cl", "image_gather4_cl_o",
@@ -13357,7 +13364,8 @@ class Gen:
             self.uses_tex_array = True
         if ncoord == 1:
             self.uses_tex_1d = True
-        if is3d and op in ("image_sample_d", "image_sample_d_cl") and ("tfe" in mods or "lwe" in mods):
+        if is3d and (op in ("image_sample_d", "image_sample_d_cl") or op in self.SAMPLE_GRAD_FORMS) and \
+                ("tfe" in mods or "lwe" in mods):
             raise Unsupported(op + " 3D gradient status")
         grad_width = 3 if is3d else min(ncoord, 2)  # an array layer has no derivative
         # Cube loads use the same 2D-array view (sampled or storage) and integer layer as array loads.
@@ -13402,7 +13410,7 @@ class Gen:
             extras = extras[:-2] if w_off else extras
             extras = extras[:-3] if extras.endswith("_cl") else extras      # the clamp is packed with the coordinates
             w_bias = 1 if extras in ("_b", "_c_b") else 0
-            w_grad = 2 * grad_width if extras in ("_d", "_d_cl") else 0
+            w_grad = 2 * grad_width if extras in ("_d", "_d_cl", "_c_d") else 0
             whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
             unpacked = []
             for i, c in enumerate(coords):
@@ -13633,7 +13641,7 @@ class Gen:
             clamp = kind.endswith("_cl")   # a min-LOD clamp, read after the coordinates (after the gradients for _d)
             if clamp:
                 kind = kind[:-3]
-                if kind not in ("", "_b", "_c", "_c_b", "_d"):
+                if kind not in ("", "_b", "_c", "_c_b", "_d", "_c_d"):
                     raise Unsupported(op)
                 self.uses_minlod = True
             # Address order after the offset: bias, z-compare, gradients, coordinates, LOD, clamp.
@@ -13644,7 +13652,7 @@ class Gen:
             if kind.startswith("_c"):
                 ref, f = f[0], f[1:]
             grads = None
-            if kind == "_d":
+            if kind in ("_d", "_c_d"):
                 # Address order: all dP/dx components, all dP/dy components, then the coordinates.
                 if len(f) < 2 * grad_width + ncoord:
                     raise Unsupported(op + " coords")
@@ -13699,8 +13707,14 @@ class Gen:
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
-            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
+            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b", "_d", "_c_d"):
                 raise Unsupported(op)
+            if off is not None and kind in ("_d", "_c_d") and TEXEL_OFFSET_FALLBACK:
+                # The fallback shifts the coordinate by texels of one mip level, which it picks from an explicit or
+                # implicit LOD; with explicit gradients that level is not computed here, so the form is refused.
+                raise Unsupported(op + " with --texel-offset-fallback (the level of explicit gradients is not modelled)")
+            if kind == "_c_d" and is3d:
+                raise Unsupported(op + " 3D (Vulkan has no depth comparison on a 3D image)")
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
             # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
             # PS) the base LOD is 0 (or bias for _b / _c_b) and the clamp raises it, so the explicit LOD is
@@ -13730,11 +13744,24 @@ class Gen:
                     masks.append("MinLod")
                     vals.append(minlod)
                 return f" {'|'.join(masks)} {' '.join(vals)}" if masks else ""
-            if kind == "_d":
+            if kind in ("_d", "_c_d"):
+                # Explicit gradients, then (SPIR-V image-operand order) the texel offset and the min-LOD clamp.
+                masks, vals = ["Grad"], [grads[0], grads[1]]
+                if off is not None:
+                    masks.append("Offset")
+                    vals.append(off)
                 if minlod is not None:
-                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
+                    masks.append("MinLod")
+                    vals.append(minlod)
+                operands = f"{'|'.join(masks)} {' '.join(vals)}"
+                if kind == "_d":
+                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} {operands}")
                 else:
-                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads[0]} {grads[1]}")
+                    d = self.tmp()
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} {operands}")
+                    # One compare result, as for the other depth-compare samples (an f16 in the low half with d16).
+                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, self.f16_bits(d) if d16 else self.tou(d))
+                    return
             elif grads_fb is not None and not kind.startswith("_c"):
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad{'|MinLod' if minlod else ''} "
                           f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
