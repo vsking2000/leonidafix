@@ -7749,7 +7749,7 @@ class Gen:
                     "image_sample_d", "image_sample_d_cl", "image_sample_d_g16", "image_sample_d_cl_g16",
                     "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.SAMPLE_GRAD_FORMS or \
-                op in self.GATHER4_LOD_OPS:
+                (op.endswith("_g16") and op[:-4] in self.SAMPLE_GRAD_FORMS) or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             self._validate_unary_f16(op, ins["op"], a, mods)
@@ -13352,16 +13352,24 @@ class Gen:
         and code) and Mesa ACO's (aco_select_nir.cpp packs ddx and ddy with one emit_pack_v1 call each,
         aco_isel_helpers.cpp emit_pack_v1 pairs halves low first and pads the last). Each half is widened with
         UnpackHalf2x16, as the a16 coordinates are. Only the gradients change: the words before them and the
-        coordinates after them are returned as they are."""
-        if op not in ("image_sample_d", "image_sample_d_cl"):
+        coordinates after them are returned as they are.
+
+        The words before them (SHADER-SAMPLE-G16-GRAD) are the `_o` texel-offset dword, then the z-compare, each a
+        whole VGPR whatever a16 and g16 say. LLVM lowerImage pushes the extra address arguments (offset, then
+        zcompare, IntrinsicsAMDGPU.td AMDGPUSampleVariants) unchanged before the gradients, packing only a 16-bit
+        bias; Mesa ACO asserts a 32-bit comparator and offset (aco_select_nir.cpp, nir_tex_src_comparator and
+        nir_tex_src_offset) and emplaces them whole before the derivatives."""
+        if op not in ("image_sample_d", "image_sample_d_cl") and op not in self.SAMPLE_GRAD_FORMS:
             raise Unsupported(op + "_g16")
+        kind = op[len("image_sample"):]
+        lead = int(kind.endswith("_o")) + int(kind.startswith("_c"))   # offset and z-compare words, kept whole
         per_axis = (grad_width + 1) // 2
-        if len(words) < 2 * per_axis:
+        if len(words) < lead + 2 * per_axis:
             raise Unsupported(op + "_g16 coords")
         grads = []
         for axis in range(2):
             halves = []
-            for w in words[axis * per_axis:(axis + 1) * per_axis]:
+            for w in words[lead + axis * per_axis:lead + (axis + 1) * per_axis]:
                 v2 = self.tmp()
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
                 for k in (0, 1):
@@ -13369,7 +13377,7 @@ class Gen:
                     self.emit(f"{h} = OpCompositeExtract %float {v2} {k}")
                     halves.append(self.tou(h))
             grads += halves[:grad_width]           # the pad half of an odd component count is dropped
-        return grads + words[2 * per_axis:]
+        return words[:lead] + grads + words[lead + 2 * per_axis:]
 
     def image_op(self, op, a, mods):
         # _g16 (SHADER-SAMPLE-G16): the same sample as the form without the suffix, with 16-bit gradients packed two

@@ -246,9 +246,9 @@ class Refusals(unittest.TestCase):
             rdna2spirv.TEXEL_OFFSET_FALLBACK = saved
 
     def test_still_refused_neighbours(self):
-        # Coarse-derivative and 16-bit-gradient forms are not part of this change.
+        # Coarse-derivative forms stay refused (their g16 forms are test_sample_g16_grad.py's).
         for line in (f"image_sample_cd v[20:23], {regs(FIRST, 6)}, {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D",
-                     f"image_sample_c_d_g16 v20, {regs(FIRST, 5)}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D"):
+                     f"image_sample_c_cd_g16 v20, {regs(FIRST, 5)}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D"):
             with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
                 translate("ps_grad_no", line)
 

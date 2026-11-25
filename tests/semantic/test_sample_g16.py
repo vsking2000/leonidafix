@@ -153,9 +153,7 @@ class G16Layout(unittest.TestCase):
 class Refusals(unittest.TestCase):
     def test_other_g16_forms(self):
         lines = [
-            # The f32-gradient compare/offset forms are a separate change (SHADER-SAMPLE-GRAD-FORMS).
-            f"image_sample_c_d_g16 v20, {regs(5)}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D",
-            f"image_sample_d_o_g16 v[20:23], {regs(5)}, {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D",
+            # The compare/offset g16 forms are translated by SHADER-SAMPLE-G16-GRAD (test_sample_g16_grad.py).
             # Coarse derivatives: no exact Vulkan form.
             f"image_sample_cd_g16 v[20:23], {regs(4)}, {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D",
             f"image_sample_c_cd_cl_o_g16 v20, {regs(7)}, {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D",
