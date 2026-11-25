@@ -226,7 +226,7 @@ def parse_line(line):
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
-                      "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_ldexp_f64", "v_trunc_f64",
+                      "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_ldexp_f64", "v_trig_preop_f64", "v_trunc_f64",
                       "v_ceil_f64", "v_rndne_f64", "v_floor_f64", "v_mul_f64", "v_fma_f64", "v_min_f64",
                       "v_max_f64", "v_cvt_i32_f64", "v_cvt_u32_f64")):
         for src, spelling in zip(args[1:], parts[1:]):

@@ -244,6 +244,50 @@ DPP_MODS = ("quad_perm", "row_", "wave_", "dpp8", "bank_mask", "bound_ctrl", "fi
 MIN_ACTIVE_RUN = 2
 
 
+def _machin_pi_bounds(bits):
+    """(lo, hi) with lo <= pi * 2**bits <= hi, exact integers (standard library only).
+
+    Machin's formula pi = 16 atan(1/5) - 4 atan(1/239), each arctangent summed as the alternating series
+    sum (-1)^k / ((2k+1) x^(2k+1)) in fixed point with 64 guard bits. Every term is floored once and the dropped
+    tail is smaller than the last term kept, so each sum is off by less than (terms + 2) units of 2**-(bits+64) (each
+    floored term is off by under one unit, and so is the tail); the bounds widen the result by that much, times the
+    16 and 4 multipliers."""
+    g = bits + 64
+    one = 1 << g
+
+    def atan_inv(x):
+        total, power, k, x2, terms = 0, one // x, 0, x * x, 0
+        while power:
+            term = power // (2 * k + 1)
+            total += -term if k & 1 else term
+            power //= x2
+            k += 1
+            terms += 1
+        return total, terms + 2
+
+    a5, n5 = atan_inv(5)
+    a239, n239 = atan_inv(239)
+    approx, err = 16 * a5 - 4 * a239, 16 * n5 + 4 * n239
+    return (approx - err) >> 64, -((-(approx + err)) >> 64)
+
+
+def two_over_pi_words(count):
+    """The first `count` 32-bit words of the binary fraction of 2/pi, most significant first.
+
+    Word k holds fraction bits 32k+1 .. 32k+32 (bit 1 being worth 1/2), i.e. floor(2/pi * 2**(32 * count)) split
+    into words; 2/pi = 0.A2F9836E 4E441529 FC2757D1 ... in hex. Derived exactly from integer bounds on pi
+    (`_machin_pi_bounds`): floor(2**(n+1) * 2**g / pi_hi) and floor(2**(n+1) * 2**g / pi_lo) must agree, which proves
+    the floor, else this raises. v_trig_preop_f64 reads windows of this constant (Gen.trig_preop_f64)."""
+    n = 32 * count
+    g = n + 64
+    lo, hi = _machin_pi_bounds(g)
+    num = 1 << (n + 1 + g)
+    q_lo, q_hi = num // hi, num // lo
+    if q_lo != q_hi:
+        raise ValueError("2/pi bits not determined; raise the guard bits")
+    return tuple((q_lo >> (32 * (count - 1 - k))) & 0xFFFFFFFF for k in range(count))
+
+
 def base_op(op):
     for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
         if op.endswith(suf):
@@ -299,6 +343,7 @@ class Gen:
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
         self.uses_d16_image = False    # a d16 image result is narrowed: needs the normalized / 32-bit-float tables
         self.uses_fmt_size = False    # %fmt_size_tab: byte size of each 7-bit buffer FORMAT code (0 = not in FORMATS)
+        self.uses_trig_preop = False  # %preop_tab: the bits of 2/pi that v_trig_preop_f64 reads (Gen.trig_preop_f64)
         self.reads_store_views = False  # a coherent image_load reads a storage view (StorageImageReadWithoutFormat)
         self.coherent_images = False    # a glc image_load/image_store: the storage views are decorated Coherent
         self.writes_depth = False
@@ -3462,6 +3507,116 @@ class Gen:
             self.emit(f"{r} = OpFunctionCall %uint %fmt_dec_c{k} {fmt} {wvec}")
             comps.append(r)
         return comps
+
+    # Words of 2/pi in %preop_tab. The largest shift the translated forms reach is 2 * 53 + (2047 - 1077) = 1076,
+    # so a window starts in word 33 at the latest and reads up to word 35.
+    TRIG_PREOP_WORDS = 36
+
+    def trig_preop_f64(self, op, a, mods):
+        """v_trig_preop_f64 vD[2], S0[2], S1: one 53-bit segment of 2/pi, for Payne-Hanek argument reduction.
+
+        The ISA text (RDNA3, RDNA4 and CDNA3 documents; see docs/design.md for what each part rests on):
+            shift = S1[4:0] * 53; if exponent(S0) > 1077 then shift += exponent(S0) - 1077
+            result = the 53 fraction bits of 2/pi after the first `shift` ones, as an integer
+            scale = -53 - shift; if exponent(S0) >= 1968 then scale += 128
+            D = ldexp(result, scale)
+        exponent() is the biased exponent field; the sign and mantissa of S0, and its NaN/inf/denormal class, are
+        not read. Only S1 = an integer constant with S1[4:0] <= 2 is translated: there the largest shift is 1076,
+        and LLVM's constant folding (AMDGPUInstCombineIntrinsic.cpp) gives 0 from a shift of 1120 on, where the ISA
+        text's 1201-bit constant does not, so a larger segment or a register segment is refused rather than picked.
+        In that domain every result is a normal double (tests/semantic/test_trig_preop_f64.py checks all 3 x 2048
+        cases of the reference), so the result is built exactly from the window's bits: no rounding, and so no
+        dependence on MODE.FP_ROUND or the denormal mode. 32-bit integer ops only (no Float64 or Int64)."""
+        if mods:
+            raise Unsupported(f"{op} modifiers (clamp and omod are not measured on this op)")
+        if len(a) != 3:
+            raise Unsupported(f"{op} operands")
+        d, sv, seg = a
+        if d.get("k") != "vgpr" or d.get("n") != 2:
+            raise Unsupported(f"{op} destination")
+        if seg.get("k") != "imm" or seg.get("abs") or seg.get("neg") or seg.get("sext"):
+            raise Unsupported(f"{op} segment operand that is not an integer constant (only S1[4:0] <= 2 is "
+                              f"translated: the sources disagree on larger shifts)")
+        c = seg["v"] & 31
+        if c > 2:
+            raise Unsupported(f"{op} segment S1[4:0] = {c} (only 0..2 is translated: from a shift of 1120 on the "
+                              f"ISA text and LLVM's constant folding disagree)")
+        # abs/neg on S0 only move its sign bit, which this op does not read.
+        _, hi = self.f64_source_words(sv, op)
+        self.uses_trig_preop = True
+        words = two_over_pi_words(self.TRIG_PREOP_WORDS)
+        # The table's length and entries are constants: register them now, while the constant section can still
+        # take them (see fmt_size_of).
+        for v in (self.TRIG_PREOP_WORDS, *words):
+            self.cu(v)
+        t = {}
+        for k in ("e", "emax", "ex", "shift", "j", "r", "j1", "j2", "rinv", "pa", "pb", "pc", "wa", "wb", "wc",
+                  "a1", "b_1", "b2", "ap", "b1", "c_1", "c2", "bp", "hi21", "t21", "u11", "lo32", "hnz", "mh_i", "mh",
+                  "mh32", "ml_i", "ml", "p", "n", "n_lt", "n1", "n1inv", "h1", "l_1", "l2", "nh1", "nl1", "nm32", "n2",
+                  "nh2", "nh", "nl", "big", "bias", "eb0", "eb", "ebs", "mant", "rhi"):
+            t[k] = self.tmp()
+        e = self.emit
+        # shift = 53 * S1[4:0] + max(exponent(S0) - 1077, 0)
+        e(f"{t['e']} = OpBitFieldUExtract %uint {hi} {self.cu(20)} {self.cu(11)}")
+        e(f"{t['emax']} = OpExtInst %uint %glsl UMax {t['e']} {self.cu(1077)}")
+        e(f"{t['ex']} = OpISub %uint {t['emax']} {self.cu(1077)}")
+        e(f"{t['shift']} = OpIAdd %uint {t['ex']} {self.cu(53 * c)}")
+        # The 53-bit window starts `shift` bits into the fraction: word j = shift / 32, bit r = shift % 32 of it
+        # (from the top). Words j..j+2 hold it; shift the 96 bits left by r and take the top 53 (hi21:lo32).
+        e(f"{t['j']} = OpShiftRightLogical %uint {t['shift']} {self.cu(5)}")
+        e(f"{t['r']} = OpBitwiseAnd %uint {t['shift']} {self.cu(31)}")
+        e(f"{t['j1']} = OpIAdd %uint {t['j']} {self.cu(1)}")
+        e(f"{t['j2']} = OpIAdd %uint {t['j']} {self.cu(2)}")
+        for idx, ptr, word in (("j", "pa", "wa"), ("j1", "pb", "wb"), ("j2", "pc", "wc")):
+            e(f"{t[ptr]} = OpAccessChain %_ptr_Private_preop_w %preop_tab {t[idx]}")
+            e(f"{t[word]} = OpLoad %uint {t[ptr]}")
+        # x << r | y >> (32 - r) without a shift by 32 (r = 0): (y >> 1) >> (31 - r).
+        e(f"{t['rinv']} = OpISub %uint {self.cu(31)} {t['r']}")
+        e(f"{t['a1']} = OpShiftLeftLogical %uint {t['wa']} {t['r']}")
+        e(f"{t['b_1']} = OpShiftRightLogical %uint {t['wb']} {self.cu(1)}")
+        e(f"{t['b2']} = OpShiftRightLogical %uint {t['b_1']} {t['rinv']}")
+        e(f"{t['ap']} = OpBitwiseOr %uint {t['a1']} {t['b2']}")
+        e(f"{t['b1']} = OpShiftLeftLogical %uint {t['wb']} {t['r']}")
+        e(f"{t['c_1']} = OpShiftRightLogical %uint {t['wc']} {self.cu(1)}")
+        e(f"{t['c2']} = OpShiftRightLogical %uint {t['c_1']} {t['rinv']}")
+        e(f"{t['bp']} = OpBitwiseOr %uint {t['b1']} {t['c2']}")
+        e(f"{t['hi21']} = OpShiftRightLogical %uint {t['ap']} {self.cu(11)}")
+        e(f"{t['t21']} = OpShiftLeftLogical %uint {t['ap']} {self.cu(21)}")
+        e(f"{t['u11']} = OpShiftRightLogical %uint {t['bp']} {self.cu(11)}")
+        e(f"{t['lo32']} = OpBitwiseOr %uint {t['t21']} {t['u11']}")
+        # Normalise: p = index of the window's top set bit (never zero in the translated domain), n = 52 - p.
+        e(f"{t['hnz']} = OpINotEqual %bool {t['hi21']} {self.cu(0)}")
+        e(f"{t['mh_i']} = OpExtInst %int %glsl FindUMsb {t['hi21']}")
+        e(f"{t['mh']} = OpBitcast %uint {t['mh_i']}")
+        e(f"{t['mh32']} = OpIAdd %uint {t['mh']} {self.cu(32)}")
+        e(f"{t['ml_i']} = OpExtInst %int %glsl FindUMsb {t['lo32']}")
+        e(f"{t['ml']} = OpBitcast %uint {t['ml_i']}")
+        e(f"{t['p']} = OpSelect %uint {t['hnz']} {t['mh32']} {t['ml']}")
+        e(f"{t['n']} = OpISub %uint {self.cu(52)} {t['p']}")
+        e(f"{t['n_lt']} = OpULessThan %bool {t['n']} {self.cu(32)}")
+        e(f"{t['n1']} = OpExtInst %uint %glsl UMin {t['n']} {self.cu(31)}")
+        e(f"{t['n1inv']} = OpISub %uint {self.cu(31)} {t['n1']}")
+        e(f"{t['h1']} = OpShiftLeftLogical %uint {t['hi21']} {t['n1']}")
+        e(f"{t['l_1']} = OpShiftRightLogical %uint {t['lo32']} {self.cu(1)}")
+        e(f"{t['l2']} = OpShiftRightLogical %uint {t['l_1']} {t['n1inv']}")
+        e(f"{t['nh1']} = OpBitwiseOr %uint {t['h1']} {t['l2']}")
+        e(f"{t['nl1']} = OpShiftLeftLogical %uint {t['lo32']} {t['n1']}")
+        e(f"{t['nm32']} = OpISub %uint {t['n']} {self.cu(32)}")
+        e(f"{t['n2']} = OpExtInst %uint %glsl UMin {t['nm32']} {self.cu(20)}")
+        e(f"{t['nh2']} = OpShiftLeftLogical %uint {t['lo32']} {t['n2']}")
+        e(f"{t['nh']} = OpSelect %uint {t['n_lt']} {t['nh1']} {t['nh2']}")
+        e(f"{t['nl']} = OpSelect %uint {t['n_lt']} {t['nl1']} {self.cu(0)}")
+        # value = window * 2^scale with its top bit at p: biased exponent p + scale + 1023
+        #       = p + 970 - shift, plus 128 when exponent(S0) >= 1968 (the field is 26 .. 1022 over the translated domain: always normal).
+        e(f"{t['big']} = OpUGreaterThanEqual %bool {t['e']} {self.cu(1968)}")
+        e(f"{t['bias']} = OpSelect %uint {t['big']} {self.cu(970 + 128)} {self.cu(970)}")
+        e(f"{t['eb0']} = OpIAdd %uint {t['p']} {t['bias']}")
+        e(f"{t['eb']} = OpISub %uint {t['eb0']} {t['shift']}")
+        e(f"{t['ebs']} = OpShiftLeftLogical %uint {t['eb']} {self.cu(20)}")
+        e(f"{t['mant']} = OpBitwiseAnd %uint {t['nh']} {self.cu(0x000FFFFF)}")
+        e(f"{t['rhi']} = OpBitwiseOr %uint {t['ebs']} {t['mant']}")
+        self.dst({"k": "vgpr", "r": d["r"], "n": 1}, t["nl"])
+        self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, t["rhi"])
 
     def fmt_size_of(self, fmt):
         """Byte size of the 7-bit buffer FORMAT code `fmt` (a uint id), 0 for a code FORMATS does not decode: one load
@@ -12230,6 +12385,8 @@ class Gen:
                 r_hi, r_lo = c2_hi, c2_lo
             self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r_lo)
             self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
+        elif op == "v_trig_preop_f64":
+            self.trig_preop_f64(op, a, mods)
         elif op in ("v_cvt_f32_u32", "v_cvt_f32_i32"):
             self._validate_cvt32_valu(ins, op, mods, float_src=False, float_dst=True)
             x = self.src_u(a[1])
@@ -15599,6 +15756,7 @@ def assemble(gen):
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
          (["%fmt_norm_mask", "%fmt_f32_mask"] if gen.uses_d16_image else []) + \
         (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
+        (["%preop_tab"] if gen.uses_trig_preop else []) + \
         (["%fmt_desc_tab", "%fmt_norm_rep_tab"] if gen.uses_fmt_tables else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
@@ -15972,6 +16130,15 @@ def assemble(gen):
             types += ["%_ptr_Private_uint = OpTypePointer Private %uint"]
         types += ["%fmt_size_init = OpConstantComposite %fmt_size_arr " + " ".join(gen.cu(v) for v in sizes)]
         gvars += ["%fmt_size_tab = OpVariable %_ptr_Private_fmt_size Private %fmt_size_init"]
+    if gen.uses_trig_preop:
+        # v_trig_preop_f64: the leading bits of 2/pi (Gen.trig_preop_f64). Its constants were registered when the
+        # instruction was translated; gen.cu only looks them up here.
+        types += [f"%preop_arr = OpTypeArray %uint {gen.cu(Gen.TRIG_PREOP_WORDS)}",
+                  "%_ptr_Private_preop = OpTypePointer Private %preop_arr",
+                  "%_ptr_Private_preop_w = OpTypePointer Private %uint",
+                  "%preop_init = OpConstantComposite %preop_arr "
+                  + " ".join(gen.cu(w) for w in two_over_pi_words(Gen.TRIG_PREOP_WORDS))]
+        gvars += ["%preop_tab = OpVariable %_ptr_Private_preop Private %preop_init"]
     if gen.uses_fmt_tables:
         # The run-time format's kind and channel widths, and the repeat constants of the exact norm quotient.
         types += [f"%fmt_desc_arr = OpTypeArray %uint {gen.cu(128)}",
