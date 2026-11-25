@@ -99,25 +99,27 @@ These touch the same files without overlapping lines (auto-merged, checked by th
 and tools/rdna2spirv.py), so it needs a rebase whatever happens to these branches. A trial merge of `pr1112` into
 all-fixes-2 (aborted afterwards, nothing committed) conflicts in four places:
 
-1. **tools/rdna2spirv.py, the `clamp_mods_f64` docstring (line ~7081).** shader-clamp-nan-f64-pk (commit 211662ff)
-   says a NaN result is +0 under DX10_CLAMP before `FClamp`. #1112 says NaN is left to the driver and that the f64
-   arithmetic and rounding ops pass only `clamp`. **This is a semantic disagreement, not a textual overlap:**
-   clamp-nan selects +0 for a NaN while #1112's text says the NaN is left to the driver. #1112's author and
-   clamp-nan's need to agree which rule stands.
+1. **tools/rdna2spirv.py, the `clamp_mods_f64` docstring (line ~7081): textual only.** shader-clamp-nan-f64-pk
+   (commit 211662ff) documents NaN -> +0 under DX10_CLAMP before `FClamp`. #1112's sentence "a NaN result ... left
+   to the driver (the hardware, with DX10_CLAMP set, gives +0 for NaN)" describes the old bare `FClamp`, and its own
+   parenthesis records the +0 that the clamp branch implements. #1112's `clamp_mods_f64` body is that bare `FClamp`
+   (`git show pr1112:tools/rdna2spirv.py`, lines 6811-6827). Resolution: the clamp branch's docstring and code, plus
+   #1112's sentence that the f64 VALU arithmetic and rounding ops hand only `clamp`, because their omod does nothing
+   while f64 denormals are kept.
 2. **tools/rdna2spirv.py, the f64 rounding ops (line ~8782).** #1112 adds
    `result = self.clamp_mods_f64(result, [m for m in mods if m == "clamp"])`. The other side is upstream/main's own
-   commit 26d010b4 (milk4sale), not one of the seven branches.
-3. **tools/rdna2spirv.py, the `v_add_f64` group (line ~8957).** #1112 adds a measured comment that the omod is
-   dropped. The other side is shader-f64-valu-ops' `elif op in self.F64_VALU_OPS: self.f64_valu(op, a, mods)` (commit
-   a44423b8). **Semantic interaction:** #1112 records that RDNA2 ignores mul:2/mul:4/div:2 on f64 arithmetic while f64
-   denormals are kept (the game MODE). shader-f64-valu-ops applies the omods of `v_mul/fma/min/max_f64` through
-   `clamp_mods_f64`. If #1112's measurement stands, shader-f64-valu-ops should pass only `clamp` (or refuse the
-   omods), as #1112 does for `v_add_f64`.
-4. **docs/design.md, the f64 rows (line ~389).** These are #1112's rewritten "`v_add_f64` output modifiers" and
-   rounding-op rows. On our side the rows come from shader-clamp-nan-f64-pk (the `v_add_f64` output modifiers row),
-   shader-f64-valu-ops (the new "Binary64 multiply, FMA, min/max and conversions" row) and shader-fract-f64 (the new
-   `v_fract_f64` row). The new rows are a neighbour overlap: keep them all. The `v_add_f64` row's content is the same
-   disagreement as point 1.
+   commit 26d010b4 (milk4sale), not one of the seven branches. Keep both.
+3. **tools/rdna2spirv.py, the `v_add_f64` group (line ~8957): textual only.** #1112 adds a measured comment that the
+   omod is dropped. The other side is shader-f64-valu-ops' `elif op in self.F64_VALU_OPS: self.f64_valu(op, a,
+   mods)`. That branch already ignores the omod: since its follow-up commit a44423b8, both `dst_f64` calls in
+   `f64_valu` pass `[m for m in mods if m == "clamp"]` (`git show origin/shader-f64-valu-ops:tools/rdna2spirv.py`,
+   lines 6880 and 6916), which agrees with #1112's measurement. Resolution: keep #1112's comment and the
+   `F64_VALU_OPS` branch.
+4. **docs/design.md, the f64 rows (line ~389): textual.** These are #1112's rewritten "`v_add_f64` output modifiers"
+   and rounding-op rows. On our side the rows come from shader-clamp-nan-f64-pk (the `v_add_f64` row's NaN -> +0
+   clamp), shader-f64-valu-ops (the new "Binary64 multiply, FMA, min/max and conversions" row) and shader-fract-f64
+   (the new `v_fract_f64` row). Keep every row. For the `v_add_f64` row, use the clamp branch's NaN -> +0 text plus
+   #1112's measured omod text, as in point 1.
 
 Branches that do not touch #1112's regions: trig-preop, div-scale-probe, sample-grad-forms, sample-g16. (`merge-tree`
 against pr1112 reports conflicts for them too, but only because pr1112's base is older than main's; those conflicts
