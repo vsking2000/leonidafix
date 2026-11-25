@@ -7746,7 +7746,8 @@ class Gen:
                     "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
-                    "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
+                    "image_sample_d", "image_sample_d_cl", "image_sample_d_g16", "image_sample_d_cl_g16",
+                    "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.SAMPLE_GRAD_FORMS or \
                 op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
@@ -13342,7 +13343,40 @@ class Gen:
         self.emit(f"{layer} = OpFSub %float {f[2]} {d}")
         return [s, t, layer] + f[3:]
 
+    def g16_gradients(self, op, words, grad_width):
+        """The address words of a _g16 sample with its packed f16 gradients widened to one f32 word per component.
+
+        GFX10 G16 packs dP/dx and dP/dy separately, two halves per VGPR, low half first, each axis padded to a whole
+        VGPR: 1D (dx/dh, -), (dx/dv, -); 2D (dx/dh, dy/dh), (dx/dv, dy/dv); 3D (dx/dh, dy/dh), (dz/dh, -),
+        (dx/dv, dy/dv), (dz/dv, -). That is LLVM's layout (SIISelLowering.cpp packImage16bitOpsToDwords, its comment
+        and code) and Mesa ACO's (aco_select_nir.cpp packs ddx and ddy with one emit_pack_v1 call each,
+        aco_isel_helpers.cpp emit_pack_v1 pairs halves low first and pads the last). Each half is widened with
+        UnpackHalf2x16, as the a16 coordinates are. Only the gradients change: the words before them and the
+        coordinates after them are returned as they are."""
+        if op not in ("image_sample_d", "image_sample_d_cl"):
+            raise Unsupported(op + "_g16")
+        per_axis = (grad_width + 1) // 2
+        if len(words) < 2 * per_axis:
+            raise Unsupported(op + "_g16 coords")
+        grads = []
+        for axis in range(2):
+            halves = []
+            for w in words[axis * per_axis:(axis + 1) * per_axis]:
+                v2 = self.tmp()
+                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {w}")
+                for k in (0, 1):
+                    h = self.tmp()
+                    self.emit(f"{h} = OpCompositeExtract %float {v2} {k}")
+                    halves.append(self.tou(h))
+            grads += halves[:grad_width]           # the pad half of an odd component count is dropped
+        return grads + words[2 * per_axis:]
+
     def image_op(self, op, a, mods):
+        # _g16 (SHADER-SAMPLE-G16): the same sample as the form without the suffix, with 16-bit gradients packed two
+        # per VGPR (expanded by g16_gradients below); everything else, a16 included, is decided independently.
+        g16 = op.endswith("_g16")
+        if g16:
+            op = op[:-4]
         a16 = "a16" in mods
         d16 = "d16" in mods
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
@@ -13393,6 +13427,8 @@ class Gen:
             self.dynamic_sampled_access(ip, f"%{iptr}", iarr, img_idx)
             self.emit(f"{img} = OpLoad %{itype} {ip}")
         coords = [self.load_reg("vgpr", r) for r in addr]
+        if g16:
+            coords = self.g16_gradients(op, coords, grad_width)
         if a16:
             # GFX10 A16 packs only the coordinates, and the LOD or clamp after them, as f16 pairs (low half first).
             # The extra arguments before them keep a whole VGPR each, and so do non-G16 gradients (LLVM AMDGPU
