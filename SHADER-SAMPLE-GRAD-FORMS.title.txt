@@ -1,0 +1,1 @@
+rdna2spirv: explicit-gradient samples with compare or offset (SHADER-SAMPLE-GRAD-FORMS)
