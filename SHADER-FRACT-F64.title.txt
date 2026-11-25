@@ -1,0 +1,1 @@
+rdna2spirv: translate v_fract_f64 (SHADER-FRACT-F64)
