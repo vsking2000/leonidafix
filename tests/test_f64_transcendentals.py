@@ -88,8 +88,16 @@ class F64TranscendentalsTest(unittest.TestCase):
                     if clamp:
                         zero_id = self._double_const_id(spv, 0.0)
                         one_id = self._double_const_id(spv, 1.0)
+                        # DX10_CLAMP: a NaN is replaced with +0 before FClamp (undefined for a NaN operand).
+                        m_nan = re.search(rf"^ *(%\w+) = OpIsNan %bool {val}$", spv, re.M)
+                        self.assertIsNotNone(m_nan)
+                        m_safe = re.search(
+                            rf"^ *(%\w+) = OpSelect %double {m_nan.group(1)} {zero_id} {val}$", spv, re.M
+                        )
+                        self.assertIsNotNone(m_safe)
                         m_cl = re.search(
-                            rf"^ *(%\w+) = OpExtInst %double %glsl FClamp {val} {zero_id} {one_id}$", spv, re.M
+                            rf"^ *(%\w+) = OpExtInst %double %glsl FClamp {m_safe.group(1)} {zero_id} {one_id}$",
+                            spv, re.M
                         )
                         self.assertIsNotNone(m_cl)
                         val = m_cl.group(1)

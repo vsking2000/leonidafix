@@ -6814,16 +6814,20 @@ class Gen:
 
     def clamp_mods_f64(self, v, mods):
         """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
-        for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
-        driver (the hardware, with DX10_CLAMP set, gives +0 for NaN)."""
+        for f32 (clamp_mods), a NaN result is +0 under the game's DX10_CLAMP=1: the RDNA2 ISA's MODE.DX10_CLAMP
+        clamps a NaN to zero in the vector ALU, and GLSL.std.450 FClamp leaves a NaN operand undefined, so the NaN
+        is replaced with +0 before FClamp. The sign of a -0 result is still left to the driver."""
         for m in mods:
             if m in ("mul:2", "mul:4", "div:2"):
                 g = self.tmp()
                 self.emit(f"{g} = OpFMul %double {v} {self.dconst({'mul:2': 2.0, 'mul:4': 4.0, 'div:2': 0.5}[m])}")
                 v = g
         if "clamp" in mods:
-            g = self.tmp()
-            self.emit(f"{g} = OpExtInst %double %glsl FClamp {v} {self.dconst(0.0)} {self.dconst(1.0)}")
+            zero = self.dconst(0.0)
+            nan, safe, g = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{nan} = OpIsNan %bool {v}")
+            self.emit(f"{safe} = OpSelect %double {nan} {zero} {v}")
+            self.emit(f"{g} = OpExtInst %double %glsl FClamp {safe} {zero} {self.dconst(1.0)}")
             return g
         return v
 
@@ -9435,11 +9439,21 @@ class Gen:
             else:
                 self.emit(f"{r} = OpExtInst %v2float %glsl {'NMax' if 'max' in op else 'NMin'} {vx} {vy}")
             if "clamp" in mods:
-                c = self.tmp()
+                # Each half as clamp_mods: a NaN half is +0 under DX10_CLAMP=1, selected before FClamp, which
+                # GLSL.std.450 leaves undefined for a NaN operand.
+                safe = []
+                for k in (0, 1):
+                    h, nan, sh = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{h} = OpCompositeExtract %float {r} {k}")
+                    self.emit(f"{nan} = OpIsNan %bool {h}")
+                    self.emit(f"{sh} = OpSelect %float {nan} %f0 {h}")
+                    safe.append(sh)
+                c, sv = self.tmp(), self.tmp()
                 z2, o2 = self.tmp(), self.tmp()
+                self.emit(f"{sv} = OpCompositeConstruct %v2float {safe[0]} {safe[1]}")
                 self.emit(f"{z2} = OpCompositeConstruct %v2float %f0 %f0")
                 self.emit(f"{o2} = OpCompositeConstruct %v2float %f1 %f1")
-                self.emit(f"{c} = OpExtInst %v2float %glsl FClamp {r} {z2} {o2}")
+                self.emit(f"{c} = OpExtInst %v2float %glsl FClamp {sv} {z2} {o2}")
                 r = c
             p = self.tmp()
             c0, c1 = self.tmp(), self.tmp()

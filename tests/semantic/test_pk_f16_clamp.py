@@ -1,7 +1,8 @@
 """Semantic tests for the clamp bit on packed f16 VOP3P ops (v_pk_add/mul/fma/max/min_f16 ... clamp).
 
 With clamp, each f16 half of the result is clamped to [0.0, 1.0] (RDNA2 ISA, VOP3P CLMP), the same as the scalar
-f16 ops. The translator clamps the vec2 with GLSL FClamp; the semantic interpreter used to take FClamp/FMax on
+f16 ops. The translator clamps the vec2 with GLSL FClamp, after replacing a NaN half with +0 (DX10_CLAMP; a NaN half
+is tested in test_vop3_clamp_nan.py, ClampNanPackedF16Tests); the semantic interpreter used to take FClamp/FMax on
 scalars only and failed with a TypeError on any packed clamp. Both halves leave through exp with a zero high half.
 """
 import os

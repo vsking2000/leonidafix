@@ -1446,7 +1446,9 @@ implementation-defined for binary64; the GPU oracle therefore counts `v_rsq_f64`
 
 Known divergence probes are excluded and counted by default, then reinserted with `--known`: binary64 output modifiers
 (SHADER-721), binary64 `OpFNegate`/`FAbs` that the CPU interpreter rounds through binary32 (TEST-912, #4172),
-driver-dependent NaN or signed-zero clamp results, and `v_div_fixup_f64` with a NaN `S0` and an ordinary finite
+an f64 `clamp` (the program is excluded by default because GLSL.std.450 `FClamp` leaves the sign of a -0 result to the
+driver: the CPU interpreter keeps the -0 where the reference gives +0; the `--known` case is a NaN, which the reference
+and the translator agree on, +0 under DX10_CLAMP), and `v_div_fixup_f64` with a NaN `S0` and an ordinary finite
 division. The latter follows the RDNA2 ISA reference (`NaN(S0) -> signed infinity`), while the current translator
 preserves the NaN payload. Therefore `--known` can intentionally return 1 when this known mismatch is reproduced;
 the minimized case is printed. `--oracle gpu` translates the same

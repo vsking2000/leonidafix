@@ -105,6 +105,29 @@ class F64DiffTests(unittest.TestCase):
         # the translator now gives the ISA's signed infinity for NaN(S0) too (#4536 was written when it kept the NaN)
         self.assertEqual(known[0], "match")
 
+    def test_f64_clamp_is_skipped_by_default_and_a_nan_runs_with_known(self):
+        setup, body, _, _ = fd.make_case(random.Random(1), "v_add_f64", known_case="f64-clamp")
+        lines = setup + body
+        self.assertTrue(any(line.endswith(" clamp") for line in body), body)
+        with tempfile.TemporaryDirectory() as tmp:
+            skipped = fd.run_one(lines, "ps_f64_clamp_default", tmp)
+            self.assertEqual(skipped[0], "skip")
+            self.assertIn("f64-clamp", skipped[1])
+            known = fd.run_one(lines, "ps_f64_clamp_known", tmp, include_known=True)
+        # DX10_CLAMP: a NaN is +0 in the reference and in the translator
+        self.assertEqual(known[0], "match")
+        self.assertEqual(known[2][:2], [0, 0])
+
+    def test_reference_f64_clamp(self):
+        # (high word of x, high word of clamp(x + 0)): NaN gives +0, -0 + 0 is +0, +inf gives 1.0, -inf 0, in range kept
+        for hi_in, hi_out in ((0x7ff80000, 0), (0x80000000, 0), (0x7ff00000, 0x3ff00000), (0xfff00000, 0),
+                              (0x3fd00000, 0x3fd00000), (0x40000000, 0x3ff00000), (0xbff00000, 0)):
+            with self.subTest(hi=hex(hi_in)):
+                out = fd.ref_program(["s_round_mode 0", "v_mov_b32 v8, 0", f"v_mov_b32 v9, {hi_in:#x}",
+                                      "v_mov_b32 v10, 0", "v_mov_b32 v11, 0", "v_add_f64 v[8:9], v[8:9], v[10:11] clamp"],
+                                     True)
+                self.assertEqual(out[:2], [0, hi_out])
+
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
                    "v_cmp_class_f64_e64 s20, v[12:13], 0x3ff"):

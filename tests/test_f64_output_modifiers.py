@@ -65,6 +65,9 @@ class F64OutputModifiersTest(unittest.TestCase):
         else:
             self.assertNotRegex(spv, r"OpFMul %double")
         if clamp:
+            # DX10_CLAMP: a NaN is replaced with +0 before FClamp, which GLSL.std.450 leaves undefined for a NaN.
+            nan = result(rf"OpIsNan %bool {value}")
+            value = result(rf"OpSelect %double {nan} {double(0.0)} {value}")
             value = result(rf"OpExtInst %double %glsl FClamp {value} {double(0.0)} {double(1.0)}")
         else:
             self.assertNotIn("FClamp", spv)
